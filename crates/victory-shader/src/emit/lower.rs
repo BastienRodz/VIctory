@@ -1469,6 +1469,10 @@ impl<'a> Lower<'a> {
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
+    ///
+    /// Tests NaN on the integer bits rather than `fcmp uno`: a float NaN test
+    /// next to min/max was folded by the Intel Arc driver (#971); integer bits
+    /// are immune.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
@@ -1476,9 +1480,18 @@ impl<'a> Lower<'a> {
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
         let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let mut is_nan = |x: V| {
+            let bits = self.as_int(x);
+            let mag = self.s.m.bin(c, Bin::And, bits, abs_mask);
+            self.s.m.cmp(c, pred::IUGT, mag, inf)
+        };
+        let nan_a = is_nan(a);
+        let nan_b = is_nan(b);
+        let nan_c = is_nan(third);
+        let nan_ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
+        let nan = self.s.m.bin(c, Bin::Or, nan_ab, nan_c);
         self.s.m.select(c, nan, least, median)
     }
 
