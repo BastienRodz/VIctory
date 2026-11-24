@@ -961,7 +961,22 @@ mod tests {
         assert_eq!(send(u, b"x".as_ptr(), 1, 0), SOCKET_ERROR);
         assert_eq!(last_error(), WSAENOTCONN);
 
-        assert_eq!(connect(u, v4(HOME, port).as_ptr(), 16), 0);
+        let other_peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        other_peer
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let other_port = other_peer.local_addr().unwrap().port();
+        assert_eq!(connect(u, v4(HOME, other_port).as_ptr(), 16), 0);
+        assert_eq!(send(u, b"r".as_ptr(), 1, 0), 1);
+        let mut data = [0; 1];
+        assert_eq!(other_peer.recv(&mut data).unwrap(), 1);
+        assert_eq!(&data, b"r");
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.recv(&mut data).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
         // On Windows `AF_INET` 0.0.0.0 also disconnects a UDP socket; Wine
         // passes it through to Linux instead of `AF_UNSPEC`, so only verify
         // the wrapper does not refuse it and the host returns 0.
