@@ -282,6 +282,15 @@ fn writable(at: usize) -> bool {
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
+/// Drops journal entries for `[start, end)` before a test frees its
+/// write-watched allocation so a reused address starts clean.
+#[cfg(test)]
+pub(crate) fn forget_pages(start: usize, end: usize) {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.written.retain(|&p, _| !(first..last).contains(&p));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
