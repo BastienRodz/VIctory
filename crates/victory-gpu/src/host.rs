@@ -53,6 +53,9 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// A 1 MiB buffer of zeros, kept for the process lifetime and bound when
+    /// a shader's root view cannot be bound from title memory.
+    zeros: OnceLock<Option<ID3D12Resource>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -222,6 +225,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            zeros: OnceLock::new(),
         })
     }
 }
@@ -275,6 +279,76 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn zero_buffer_is_aligned_sized_and_zeroed() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let buffer = host.zero_buffer().expect("zero buffer");
+        // SAFETY: a plain query on a live buffer.
+        let size = unsafe { buffer.GetDesc() }.Width;
+        assert!(size >= 1 << 20);
+        let gpu = host.zero_view().expect("zero view address");
+        assert_ne!(gpu, 0);
+        assert_eq!(gpu % 256, 0);
+        assert_eq!(host.zero_view(), Some(gpu));
+
+        let readback = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut back: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut back,
+                )
+                .unwrap();
+        }
+        let back = back.unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list; `buffer` is in GENERIC_READ (COPY_SOURCE) and
+        // `back` is in COPY_DEST, both `size` bytes.
+        unsafe { list.list.CopyResource(&back, buffer) };
+        list.close();
+        host.execute(&[&list]);
+
+        let mut data = std::ptr::null_mut();
+        let read_range = D3D12_RANGE {
+            Begin: 0,
+            End: size as usize,
+        };
+        let empty = D3D12_RANGE { Begin: 0, End: 0 };
+        // SAFETY: `back` is a readback buffer the finished list copied into.
+        let all_zero = unsafe {
+            back.Map(0, Some(&read_range), Some(&mut data)).unwrap();
+            let slice = std::slice::from_raw_parts(data.cast::<u8>(), size as usize);
+            let ok = slice.iter().all(|&b| b == 0);
+            back.Unmap(0, Some(&empty));
+            ok
+        };
+        assert!(all_zero);
     }
 }
 
@@ -1391,7 +1465,38 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
     }
 }
 
+/// Size of [`Host::zero_buffer`]: covers the largest root view shaders read
+/// (1 MiB for root SRVs; root CBVs are 64 KiB).
+const ZERO_BUFFER: u64 = 1 << 20;
+
 impl Host {
+    /// A host-owned, never-written 1 MiB buffer of zeros (256-byte aligned,
+    /// GPU-readable in `GENERIC_READ`), made on first use and kept for the
+    /// process lifetime. Bound for root views the host cannot bind from title
+    /// memory so the root parameter is not left unbound.
+    fn zero_buffer(&self) -> Option<&ID3D12Resource> {
+        self.zeros
+            .get_or_init(|| {
+                let (buffer, data) = self.upload_buffer(ZERO_BUFFER)?;
+                name(&buffer, || "zero root view".into());
+                // SAFETY: `data` is the mapped upload buffer of `ZERO_BUFFER`
+                // bytes; unmapped right after so it is never written again.
+                unsafe {
+                    data.write_bytes(0, ZERO_BUFFER as usize);
+                    buffer.Unmap(0, None);
+                }
+                Some(buffer)
+            })
+            .as_ref()
+    }
+
+    /// The GPU virtual address of [`Host::zero_buffer`].
+    pub(crate) fn zero_view(&self) -> Option<u64> {
+        let buffer = self.zero_buffer()?;
+        // SAFETY: a live buffer owned by `self` for the process lifetime.
+        Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {

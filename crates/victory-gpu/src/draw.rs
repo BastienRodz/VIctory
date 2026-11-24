@@ -158,6 +158,35 @@ macro_rules! once {
     }};
 }
 
+/// The host GPU address for a stage's root view: its title buffer's host
+/// address, or the host's zero buffer when the title did not set the slot or
+/// its address cannot be bound from title buffers. Leaving a root descriptor
+/// unbound is undefined in D3D12 and faults at address 0 on AMD/RADV; the
+/// draw still runs because a shader may read the view only on an untaken
+/// branch.
+fn bind_root_view(list: &HostList, root: Option<&Root>, slot: u8, srv: bool) -> Option<u64> {
+    let found = match root {
+        Some(Root::View(address)) => {
+            let gpu = (*address != 0)
+                .then(|| root_view(list, *address, srv))
+                .flatten();
+            if gpu.is_none() {
+                once!(
+                    slot,
+                    address = format_args!("{address:#x}"),
+                    "a root view outside title buffers reads zeros"
+                );
+            }
+            gpu
+        }
+        _ => {
+            once!(slot, "a shader reads a root view the title did not set");
+            None
+        }
+    };
+    found.or_else(|| crate::host::host()?.zero_view())
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -493,12 +522,12 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
-                    };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = bind_root_view(
+                        list,
+                        self.roots_ref(compute).get(usize::from(slot)),
+                        slot,
+                        srv,
+                    ) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -1214,4 +1243,47 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbound_or_unmapped_root_view_binds_zeros() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = host.new_list().unwrap();
+        let zeros = host.zero_view().expect("zero view address");
+        for srv in [false, true] {
+            assert_eq!(bind_root_view(&list, None, 0, srv), Some(zeros));
+            assert_eq!(
+                bind_root_view(&list, Some(&Root::None), 0, srv),
+                Some(zeros)
+            );
+            assert_eq!(
+                bind_root_view(&list, Some(&Root::View(0)), 0, srv),
+                Some(zeros)
+            );
+            assert_eq!(
+                bind_root_view(&list, Some(&Root::View(u64::MAX)), 0, srv),
+                Some(zeros)
+            );
+        }
+
+        let buf = vec![0u8; 512];
+        let address = buf.as_ptr() as u64;
+        crate::shadow::register(usize::MAX, address, buf.len() as u64);
+        let cbv = bind_root_view(&list, Some(&Root::View(address)), 0, false);
+        let srv = bind_root_view(&list, Some(&Root::View(address)), 0, true);
+        crate::shadow::unregister(usize::MAX, address);
+
+        let cbv = cbv.expect("mapped CBV");
+        let srv = srv.expect("mapped SRV");
+        assert_ne!(cbv, zeros);
+        assert_eq!(cbv % 256, 0);
+        assert_ne!(srv, zeros);
+        list.close();
+    }
 }
