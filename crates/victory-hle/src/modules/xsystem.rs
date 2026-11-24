@@ -377,6 +377,39 @@ mod tests {
     use crate::modules::xgameruntime::{S_OK, method};
 
     #[test]
+    fn sandbox_minimum_reaches_both_runtime_interfaces() {
+        use crate::modules::{xasync::E_NOT_SUFFICIENT_BUFFER, xgameruntime::QueryApiImpl};
+
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        for iid in [IID, IID_2026] {
+            let mut object = std::ptr::null_mut();
+            assert_eq!(QueryApiImpl(&PROVIDER, &iid, &mut object), S_OK);
+            assert_eq!(object.cast_const().cast::<Object>(), &raw const OBJECT);
+            // SAFETY: the query returned the static system object.
+            let object = unsafe { &*object.cast::<Object>() };
+            let get = method::<Get>(object, 0x20);
+            for size in 7..16 {
+                let mut bytes = [0xa5; 17];
+                let mut used = usize::MAX;
+                assert_eq!(
+                    get(object, size, bytes.as_mut_ptr(), &mut used),
+                    E_NOT_SUFFICIENT_BUFFER
+                );
+                assert_eq!(bytes, [0xa5; 17]);
+                assert_eq!(used, usize::MAX);
+            }
+            for size in [16, 17] {
+                let mut bytes = [0xa5; 17];
+                let mut used = 0;
+                assert_eq!(get(object, size, bytes.as_mut_ptr(), &mut used), S_OK);
+                assert_eq!(used, 7);
+                assert_eq!(&bytes[..used], b"RETAIL\0");
+                assert_eq!(&bytes[used..], &[0xa5; 10]);
+            }
+        }
+    }
+
+    #[test]
     fn identity_strings_fit_the_documented_sizes() {
         type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
         let this: This = &OBJECT;
