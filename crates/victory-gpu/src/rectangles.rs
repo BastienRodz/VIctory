@@ -405,8 +405,11 @@ float half_to_f32(uint h) {
 uint f32_to_half(float v) {
     uint bits = asuint(v);
     uint sgn = (bits >> 16u) & 0x8000u;
-    int ex = (int)((bits >> 23u) & 0xffu) - 127 + 15;
+    uint raw_exp = (bits >> 23u) & 0xffu;
     uint man = bits & 0x7fffffu;
+    // Keep the sign and available payload, and quiet signalling NaNs.
+    if (raw_exp == 0xffu && man != 0u) return sgn | 0x7e00u | (man >> 13u);
+    int ex = (int)raw_exp - 127 + 15;
     if (ex >= 31) return sgn | 0x7c00u;
     if (ex <= 0) {
         // Half subnormals, rounded to even, as primitive.rs makes them.
@@ -1071,7 +1074,7 @@ mod tests {
             out
         };
         // 3 rectangles (9 vertices total):
-        // Rect 0: standard full-screen quad
+        // Rect 0: full-screen quad with a NaN in a half-float attribute
         // Rect 1: clamped colors, negative half-floats (u) and a half
         // subnormal fourth corner (v)
         // Rect 2: used by record 1 starting at vertex 6
@@ -1080,7 +1083,7 @@ mod tests {
             vertex(
                 -1.0,
                 1.0,
-                0x0000,
+                0x7e00,
                 0x0000,
                 0,
                 10000,
@@ -1295,7 +1298,19 @@ mod tests {
             &raw_elements,
         );
         let start0 = out_recs[0][2] as usize * STRIDE;
-        assert_eq!(&gpu_out[start0..start0 + 12 * STRIDE], &expected0[..]);
+        let actual0 = &gpu_out[start0..start0 + 12 * STRIDE];
+        let corner = 5 * STRIDE + 8;
+        // The sign and payload of a NaN after arithmetic may vary by backend.
+        for output in [actual0, &expected0[..]] {
+            let half = u16::from_le_bytes(output[corner..corner + 2].try_into().unwrap());
+            assert_eq!(
+                half & 0x7e00,
+                0x7e00,
+                "fourth corner must contain a quiet NaN"
+            );
+        }
+        assert_eq!(&actual0[..corner], &expected0[..corner]);
+        assert_eq!(&actual0[corner + 2..], &expected0[corner + 2..]);
 
         let mut expected1 = vec![0u8; 6 * STRIDE];
         primitive::expand_rects(
