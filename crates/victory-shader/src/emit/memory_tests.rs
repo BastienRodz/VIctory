@@ -17,6 +17,8 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+mod computed_table;
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 const S_WAITCNT_ALL: u32 = 0xBF8C_0000;
 /// Inline constant 0, 64.
