@@ -5088,7 +5088,7 @@ impl<'a> Lower<'a> {
     }
 
     /// A handle for the descriptor `src` read at `site`; the heap index of
-    /// a texture shader view the program takes from the heap itself is noted
+    /// a texture shader view at a dynamic index is noted
     /// for the instruction's read mark (handles are made once per block,
     /// often before the instruction). A view read at a fixed table entry
     /// needs none: the host makes the used-resource list's slots for the
@@ -5098,6 +5098,9 @@ impl<'a> Lower<'a> {
         if let Some(&index) = self.s.texture_index.get(&h)
             && !self.fixed_table_entry(src)
         {
+            // The host must refresh textures reached at computed table
+            // indices through the heap, too.
+            self.heap[0] = true;
             self.s.texture_reads.push(index);
         }
         Ok(h)

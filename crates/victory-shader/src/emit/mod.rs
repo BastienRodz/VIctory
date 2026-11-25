@@ -310,9 +310,9 @@ pub struct HostShader {
     /// sizes from their descriptors: the host binds the view addresses `t1`
     /// in [`MEMORY_SPACE`] (module notes, "View addresses").
     pub view_addresses: bool,
-    /// Whether it takes descriptors from the resource heap at indices it
-    /// computes (root type 5, not through a table): the host cannot tell
-    /// which views it reads, so every view in the heap must be current.
+    /// Whether it uses views the host cannot know from the listed
+    /// resources: heap-direct descriptors or textures at computed table
+    /// indices. The host refreshes these through the bound heap.
     pub heap: bool,
     /// Whether some of those are unordered access views: it may write
     /// through any of the heap's.
