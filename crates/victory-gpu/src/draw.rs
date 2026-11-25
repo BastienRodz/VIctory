@@ -2021,6 +2021,116 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A translated compute shader marks a placed texture via a computed
+    /// table index. Its next submission must upload that texture's bytes.
+    #[test]
+    fn computed_table_read_uploads_a_placed_texture() {
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{HwStage, NativeProgram, RootParam, dxbc, emit, io, ir, resource, structure};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // s[4:5] holds the table's address; s7 holds a runtime index.
+        // s6 = s7 << 5; load the 8-dword descriptor at table + s6,
+        // then image_load with a zero coordinate.
+        let code = [
+            0xBE85_0380u32, 0x8F06_8507, 0xF40C_0302, 6 << 25, 0xBF8C_0000,
+            0x7E00_0280, 0x7E02_0280, 0xF000_1F08, 0x0003_0200, 0xBF8C_0000, 0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: [RootType::Table, RootType::Constants].into_iter().enumerate().map(|(slot, root)| RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: [4, 7][slot],
+                slot: slot as u8,
+            }).collect(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo { rsrc2: 8 << 1, threads: [1, 1, 1] }),
+            code: code.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let mut header = [0; 32];
+        header[..4].copy_from_slice(b"DXBC");
+        header[20] = 1;
+        header[24] = 32;
+        let container = dxbc::Container::parse(&header).unwrap();
+        let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let flow = structure::structure(&program).unwrap();
+        let resources = resource::track(&program, &native.layout, native.stage, Some(&flow)).unwrap();
+        let inputs = io::raise(&program, &native).unwrap();
+        let shader = emit::emit_with(&container, &native, &program, &flow, &inputs, &resources,
+            emit::Options { view_marks: true, ..Default::default() },
+        ).unwrap();
+        assert!(shader.view_marks);
+        let pipeline = HostPipeline::new(&[crate::pipeline::Shader::from_test_translation(shader)], None)
+            .expect("a pipeline for the computed table read");
+        let null = std::ptr::null();
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let heap_host = title_heap.host().expect("a host view heap");
+        // A table at slot 1 with a placed 4x1 RGBA8 view at entry 3.
+        let address = title_memory(1 << 16);
+        // SAFETY: the first 16 bytes hold four linear RGBA8 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x80, 16) };
+        let words = texture_words(4, 1, 28, 0x100, 0);
+        let View::Placed(_, _, desc) = placed_view(address, words) else { unreachable!() };
+        crate::descriptor::create_placed_srv(null, &words, &desc, title_heap.start + 4 * 32);
+        let (read, read_pso) = compile_cs(r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float4> image : register(t0);
+RWByteAddressBuffer output : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { output.Store(0, (uint)round(image.Load(int3(0, 0, 0)).x * 255.0)); }
+"#);
+        let (out, data) = host.shared_buffer(4).unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, title_heap.start + 32);
+        state.set_constants(true, 1, &[3], 0);
+        assert!(state.bind(&list, &pipeline, true));
+        // SAFETY: both pipelines and their resources are live. The first
+        // dispatch emits the mark; the second reads the selected texel.
+        unsafe {
+            let l = &list.list;
+            l.Dispatch(1, 1, 1);
+            l.SetComputeRootSignature(&read);
+            l.SetComputeRootDescriptorTable(0, heap_host.gpu(4));
+            l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            l.SetPipelineState(&read_pso);
+            l.Dispatch(1, 1, 1);
+        }
+        list.close();
+        let run = || {
+            host.execute(&[&list]);
+            // SAFETY: the mapped output is live and the GPU has finished.
+            unsafe { data.cast::<u32>().read() }
+        };
+        assert_eq!(run(), 0, "the lazy slot starts null");
+        // A write to the descriptor can leave a reset queued for the first
+        // submission. Let the same shader mark the slot again.
+        let mut texel = 0;
+        for _ in 0..3 {
+            texel = run();
+            if texel != 0 {
+                break;
+            }
+        }
+        let made = crate::resource::texture_at(address, &words)
+            .and_then(crate::resource::made_copy).is_some();
+        crate::object::release(heap);
+        assert!(made, "the read mark made the placed texture");
+        assert_eq!(texel, 0x80, "the marked texture's title bytes were uploaded");
+    }
+
     /// Which pixels of a 64x64 host D32S8 `texture` (title texture `depth`)
     /// pass an EQUAL depth test against a square (two triangles, as the
     /// title's rectangles become) drawn over pixel `k - 1` (row by row) with

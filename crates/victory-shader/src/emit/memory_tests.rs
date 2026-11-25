@@ -639,8 +639,10 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         let mut w = vec![s_mov_b32(5, ZERO as u8)];
         let mut load = s_load(3, 12, 4, offset);
         if dynamic {
-            // v_readfirstlane_b32 s6, v0; s_lshl_b32 s6, s6, 5; s6 the soffset.
-            w.extend([0x7E0C_0500, 0x8F06_8506]);
+            // v6 = s7 (a runtime root constant); read its first lane into
+            // s6 and multiply by the 32-byte descriptor step.
+            w.push(v_mov_b32(6, 7));
+            w.extend([0x7E0C_0506, 0x8F06_8506]);
             load[1] = 6 << 25 | offset;
         }
         w.extend(load);
@@ -650,21 +652,32 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         w.extend([0xF000_1F08, 0x0003_0200]);
         w.push(S_WAITCNT_ALL);
         w.push(S_ENDPGM);
+        let mut layout = vec![RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }];
+        if dynamic {
+            layout.push(RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 7,
+                slot: 1,
+            });
+        }
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
             vgprs: 8,
-            layout: vec![RootParam {
-                root,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 4,
-                slot: 0,
-            }],
+            layout,
             used,
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 5 << 1,
+                rsrc2: if dynamic { 8 << 1 } else { 5 << 1 },
                 threads: [1, 1, 1],
             }),
             code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -698,15 +711,15 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         slot: 0,
     }];
     let table = lower_with(RootType::Table, used.clone(), 0, false);
-    assert!(!table.view_marks, "a table read marks nothing");
+    assert!(!table.view_marks && !table.heap, "a fixed table entry is prepared by the draw");
     let computed = lower_with(RootType::Table, used, 0, true);
     assert!(
-        computed.view_marks && !computed.heap,
-        "a read at a computed table entry is marked"
+        computed.view_marks && computed.heap,
+        "a computed table entry is marked and refreshed through the heap"
     );
     let l = lower_with(RootType::ResourceHeap, Vec::new(), 32, false);
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
-    let shader = HostShader {
+    let shader = |l: lower::Lowered| HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -722,8 +735,11 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     };
+    let (direct, computed) = (shader(l), shader(computed));
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        for shader in [&direct, &computed] {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
     }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -736,28 +752,43 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        // The heap's base is 0 in the user data (`emit`, "Binding").
-        let ud = vec![0u32; shader.user_data_dwords() as usize];
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE; 4] }),
-                        (2, Root::Uav(words)),
-                    ],
-                    views: &[View::Texture(1, 1, &texel), View::Texture(1, 1, &texel)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let bits = &out[0];
-        let marked: Vec<usize> = (0..bits.len() * 32).filter(|&b| bits[b / 32] >> (b % 32) & 1 != 0).collect();
-        assert_eq!(marked, [super::VIEW_READS as usize + 1], "{label}: the slot read");
+        let views: [_; 5] = std::array::from_fn(|_| View::Texture(1, 1, &texel));
+        for (shader, entries) in [(&direct, &[0][..]), (&computed, &[1, 3][..])] {
+            let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+            for &entry in entries {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    // The computed table starts at heap slot 1.
+                    ud[u.index as usize] = match u.root {
+                        RootType::Table => 32,
+                        RootType::Constants => entry,
+                        _ => 0,
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud)),
+                                (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE; 10] }),
+                                (2, Root::Uav(words)),
+                            ],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+                let bits = &out[0];
+                let marked: Vec<usize> = (0..bits.len() * 32)
+                    .filter(|&b| bits[b / 32] >> (b % 32) & 1 != 0)
+                    .collect();
+                assert_eq!(marked, [super::VIEW_READS as usize + 1 + entry as usize],
+                    "{label}: read mark for entry {entry}");
+            }
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
