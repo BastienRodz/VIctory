@@ -1177,6 +1177,27 @@ mod host {
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
 
+    #[cfg(test)]
+    std::thread_local! {
+        static TEST_KEYS: std::cell::Cell<Option<&'static [u8]>> = const {
+            std::cell::Cell::new(None)
+        };
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_keys(keys: Option<&'static [u8]>) {
+        TEST_KEYS.set(keys);
+    }
+
+    fn key_is_down(vk: u8) -> bool {
+        #[cfg(test)]
+        if let Some(keys) = TEST_KEYS.get() {
+            return keys.contains(&vk);
+        }
+        // SAFETY: plain query.
+        (unsafe { GetAsyncKeyState(i32::from(vk)) }) < 0
+    }
+
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
         (XINPUT_GAMEPAD_BACK, VIEW),
@@ -1254,7 +1275,7 @@ mod host {
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                    .filter(|&vk| key_is_down(vk))
                     .collect();
                 down.extend(held);
             }
@@ -1325,6 +1346,10 @@ mod host {
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
+        #[cfg(test)]
+        if TEST_KEYS.get().is_some() {
+            return true;
+        }
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
@@ -1662,6 +1687,44 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_readings_preserve_press_order_and_existing_snapshots() {
+        let hub = Hub::new(Box::new(host::Host::default()));
+        let poll = |keys: &'static [u8]| {
+            host::set_test_keys(Some(keys));
+            hub.poll();
+            host::set_test_keys(None);
+            current(hub, KEYBOARD_KIND, KEYBOARD).unwrap()
+        };
+        let keys = |reading, capacity| {
+            let state = slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(
+                reading, 0x78,
+            );
+            let mut output = [KeyState::default(); 3];
+            let count = state(reading, capacity, output.as_mut_ptr());
+            output[..count as usize]
+                .iter()
+                .map(|key| key.virtual_key)
+                .collect::<Vec<_>>()
+        };
+        let z = poll(b"Z");
+        let za = poll(b"AZ");
+        let zab = poll(b"ABZ");
+        let ab = poll(b"AB");
+        let abz = poll(b"ABZ");
+
+        assert_eq!(keys(z, 3), b"Z");
+        assert_eq!(keys(za, 3), b"ZA");
+        assert_eq!(keys(zab, 3), b"ZAB");
+        assert_eq!(keys(zab, 2), b"ZA");
+        assert_eq!(keys(ab, 3), b"AB");
+        assert_eq!(keys(abz, 3), b"ABZ");
+        for reading in [z, za, zab, ab, abz] {
+            release(reading);
+        }
     }
 
     #[test]
